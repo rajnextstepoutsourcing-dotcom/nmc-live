@@ -1,0 +1,58 @@
+:root {
+  --bg: #0b1220;
+  --card: #121a2b;
+  --text: #e8eefc;
+  --muted: #9fb0d0;
+  --border: #23304b;
+  --btn: #2e6bff;
+  --btn2: #2458d8;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+  background: var(--bg);
+  color: var(--text);
+}
+.container {
+  max-width: 720px;
+  margin: 40px auto;
+  padding: 0 16px;
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 18px;
+  margin-top: 16px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.25);
+}
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.block { display: block; }
+input[type="file"] {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.02);
+  color: var(--text);
+}
+.actions { margin-top: 14px; }
+button {
+  border: 0;
+  padding: 10px 14px;
+  border-radius: 12px;
+  cursor: pointer;
+  font-weight: 600;
+}
+button.primary {
+  background: var(--btn);
+  color: white;
+}
+button.primary:hover { background: var(--btn2); }
+button:disabled { opacity: .6; cursor: not-allowed; }
+.status { margin-top: 10px; min-height: 18px; }

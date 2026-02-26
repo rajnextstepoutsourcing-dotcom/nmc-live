@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NMC Live Check</title>
+  <link rel="stylesheet" href="/static/styles.css?v=1" />
+</head>
+<body>
+  <div class="container">
+    <h1>NMC Live Check</h1>
+    <p class="muted">Upload an NMC document and download the register PDF.</p>
+
+    <section class="card">
+      <label class="block">
+        NMC document (PDF / JPG / PNG)
+        <input id="file" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" />
+      </label>
+
+      <div class="actions">
+        <button id="btn" class="primary">Run & Download PDF</button>
+      </div>
+
+      <div id="status" class="status muted"></div>
+    </section>
+
+    <footer class="muted small">
+      If the document is unclear or the website blocks access, you will still receive a PDF explaining the issue.
+    </footer>
+  </div>
+
+  <script src="/static/app.js?v=1"></script>
+</body>
+</html>
