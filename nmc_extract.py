@@ -30,13 +30,26 @@ STRICT_NMC_RE = re.compile(r"\b\d{2}[A-L]\d{4}[ESWNO]\b", re.I)
 LOOSE_8_RE = re.compile(r"\b\d{2}[A-Z]\d{4}[A-Z]\b", re.I)
 
 ANCHOR_RE = re.compile(
-    r"(NMC\s*PIN|PIN\s*number|Pin\s*number|Registration\s*number|NMC\s*registration\s*number)",
+    r"("
+    r"NMC\s*PIN"
+    r"|NMC\s*PIN\s*NUMBER"
+    r"|PIN\s*NUMBER"
+    r"|PIN\s*NO\.?"
+    r"|PIN\s*#"
+    r"|PIN\s*:"
+    r"|REGISTRATION\s*NUMBER"
+    r"|NMC\s*REGISTRATION\s*NUMBER"
+    r"|PERSONAL\s*IDENTIFICATION\s*NUMBER"
+    r")",
     re.I
 )
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL_FAST = os.getenv("GEMINI_MODEL_FAST", "gemini-2.0-flash")
 GEMINI_MODEL_STRONG = os.getenv("GEMINI_MODEL_STRONG", "gemini-2.5-pro")
+
+NMC_PDF_TEXT_PAGES = int(os.getenv("NMC_PDF_TEXT_PAGES", "8"))
+NMC_PDF_IMAGE_PAGES = int(os.getenv("NMC_PDF_IMAGE_PAGES", "4"))
 
 _client = None
 if GEMINI_API_KEY and genai is not None:
@@ -231,7 +244,7 @@ def _gemini_extract(images: List[Tuple[bytes, str]]) -> Tuple[Optional[str], flo
         return None, 0.0
 
     prompt = (
-        "Extract the NMC PIN from the document image. "
+        "Extract the NMC PIN from the document image (it may be on an application form). Look for labels like 'NMC PIN', 'PIN number', or 'Registration number'. "
         "Return ONLY the PIN value, nothing else.\n"
         "Valid format:\n"
         "- 2 digits (year)\n"
@@ -273,12 +286,28 @@ def extract_nmc_pin(file_path: Path) -> Dict[str, Any]:
 
     # PDF
     if path.suffix.lower() == ".pdf":
-        text = _read_pdf_text(path)
+        # 1) Text extraction (page-by-page, stops early)
+        try:
+            with pdfplumber.open(str(path)) as pdf:
+                combined_parts = []
+                for page in pdf.pages[:max(1, NMC_PDF_TEXT_PAGES)]:
+                    t = page.extract_text() or ""
+                    if t:
+                        # Try on this page first (helps when PIN is later in the PDF)
+                        pin_page, conf_page = _extract_from_text(t)
+                        if pin_page:
+                            return {"ok": True, "nmc_pin": pin_page, "confidence": {"nmc_pin": conf_page}}
+                        combined_parts.append(t)
+                text = "\n".join(combined_parts)
+        except Exception:
+            text = ""
+
         pin, conf = _extract_from_text(text)
         if pin:
             return {"ok": True, "nmc_pin": pin, "confidence": {"nmc_pin": conf}}
 
-        imgs = _pdf_to_images(path)
+        # 2) Vision extraction (render first N pages as images)
+        imgs = _pdf_to_images(path, max_pages=max(1, NMC_PDF_IMAGE_PAGES))
         pin2, conf2 = _gemini_extract(imgs)
         if pin2:
             return {"ok": True, "nmc_pin": pin2, "confidence": {"nmc_pin": conf2}}

@@ -22,7 +22,7 @@ async def _page_text(page) -> str:
             return ""
 
 
-async def _click_if_exists(page, selectors, timeout_ms: int = 1500) -> bool:
+async def _click_if_exists(page, selectors, timeout_ms: int = 2000) -> bool:
     for sel in selectors:
         try:
             loc = page.locator(sel)
@@ -34,10 +34,35 @@ async def _click_if_exists(page, selectors, timeout_ms: int = 1500) -> bool:
     return False
 
 
+async def _accept_cookies(page) -> None:
+    # NMC uses Cookiebot / sometimes OneTrust; try multiple common selectors/texts
+    selectors = [
+        "#onetrust-accept-btn-handler",
+        "button:has-text('Accept all cookies')",
+        "button:has-text('I agree to all cookies')",
+        "button:has-text('Accept cookies')",
+        "button:has-text('Accept all')",
+        # Cookiebot common ids/classes
+        "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+        "button#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+        "button:has-text('Allow all')",
+    ]
+    # Sometimes the banner animates in; give it a moment but don't block long
+    for _ in range(2):
+        clicked = await _click_if_exists(page, selectors, timeout_ms=2500)
+        if clicked:
+            try:
+                await page.wait_for_timeout(400)
+            except Exception:
+                pass
+            break
+
+
 async def _detect_blocked(page) -> Optional[str]:
     txt = (await _page_text(page)).lower()
     keywords = [
         "verify you are not a robot",
+        "please verify you are not a robot",
         "captcha",
         "cloudflare",
         "attention required",
@@ -80,17 +105,49 @@ async def _save_snapshot_pdf(page, out_path: Path) -> None:
         await page.emulate_media(media="screen")
     except Exception:
         pass
-    # If this fails (rare), caller will still return a simple error PDF from app.py
     await page.pdf(path=str(out_path), format="A4", print_background=True)
+
+
+async def _fill_pin(page, pin: str) -> None:
+    # Try the most specific selectors first to avoid the header search box, etc.
+    candidates = [
+        "input[name*='pin' i]",
+        "input[id*='pin' i]",
+        "input[aria-label*='pin' i]",
+        "input[placeholder*='pin' i]",
+        "input[type='text']",
+    ]
+
+    # Prefer inputs inside the main content/form area
+    for sel in candidates:
+        try:
+            loc = page.locator("main " + sel)
+            if await loc.count() > 0:
+                await loc.first.fill(pin, timeout=8000)
+                return
+        except Exception:
+            pass
+
+    # Fallback: any matching input
+    for sel in candidates:
+        try:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                await loc.first.fill(pin, timeout=8000)
+                return
+        except Exception:
+            pass
+
+    raise RuntimeError("Could not find PIN input field")
 
 
 async def run_nmc_check_and_download_pdf(
     *,
     nmc_pin: str,
     out_dir: str,
-    timeout_ms: int = 60000,
+    timeout_ms: int = 70000,
 ) -> Dict[str, Any]:
-    """Runs NMC register check and downloads the official PDF when possible.
+    """Runs NMC register search and downloads the official PDF when possible.
 
     Always returns a PDF path in `pdf_path`:
       - official PDF on success
@@ -116,17 +173,8 @@ async def run_nmc_check_and_download_pdf(
         try:
             await page.goto(NMC_START_URL, wait_until="domcontentloaded", timeout=timeout_ms)
 
-            # Cookies banner (only if present)
-            await _click_if_exists(
-                page,
-                [
-                    "#onetrust-accept-btn-handler",
-                    "button:has-text('Accept all cookies')",
-                    "button:has-text('I agree to all cookies')",
-                    "button:has-text('Accept cookies')",
-                    "button:has-text('Accept all')",
-                ],
-            )
+            # Accept cookies first (NMC mentions robot checks if cookies not accepted)
+            await _accept_cookies(page)
 
             blocked = await _detect_blocked(page)
             if blocked:
@@ -134,23 +182,26 @@ async def run_nmc_check_and_download_pdf(
                 return {"ok": False, "error": blocked, "pdf_path": str(error_pdf)}
 
             # Fill PIN
+            await _fill_pin(page, pin)
+
+            # Click Search
             try:
-                await page.get_by_label(re.compile(r"pin number", re.I)).fill(pin, timeout=8000)
+                await page.get_by_role("button", name=re.compile(r"^search$", re.I)).click(timeout=20000)
             except Exception:
-                await page.locator("input[type='text']").first.fill(pin, timeout=8000)
+                try:
+                    await page.locator("button:has-text('Search')").first.click(timeout=20000)
+                except Exception:
+                    # sometimes it's an input[type=submit]
+                    await page.locator("input[type='submit']").first.click(timeout=20000)
 
-            # Search
+            # Wait for results OR known error
             try:
-                await page.get_by_role("button", name=re.compile(r"search", re.I)).click(timeout=15000)
+                await page.wait_for_selector("a:has-text('View details')", timeout=25000)
             except Exception:
-                await page.locator("button:has-text('Search')").first.click(timeout=15000)
-
-            await page.wait_for_timeout(800)
-
-            inv = await _detect_invalid_pin_or_no_results(page)
-            if inv:
-                await _save_snapshot_pdf(page, error_pdf)
-                return {"ok": False, "error": inv, "pdf_path": str(error_pdf)}
+                inv = await _detect_invalid_pin_or_no_results(page)
+                if inv:
+                    await _save_snapshot_pdf(page, error_pdf)
+                    return {"ok": False, "error": inv, "pdf_path": str(error_pdf)}
 
             blocked = await _detect_blocked(page)
             if blocked:
@@ -172,8 +223,8 @@ async def run_nmc_check_and_download_pdf(
 
             # Download official PDF
             try:
-                async with page.expect_download(timeout=30000) as dl_info:
-                    await page.get_by_role("link", name=re.compile(r"download.*pdf", re.I)).click(timeout=20000)
+                async with page.expect_download(timeout=35000) as dl_info:
+                    await page.get_by_role("link", name=re.compile(r"download.*pdf", re.I)).click(timeout=25000)
                 download = await dl_info.value
                 await download.save_as(str(official_pdf))
                 if official_pdf.exists():

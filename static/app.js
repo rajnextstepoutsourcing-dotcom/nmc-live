@@ -22,6 +22,13 @@ function downloadBlob(blob, filename) {
   window.URL.revokeObjectURL(url);
 }
 
+function setStep2Enabled(enabled) {
+  pinInput.disabled = !enabled;
+  btnRun.disabled = !enabled;
+}
+
+setStep2Enabled(false);
+
 btnExtract.addEventListener('click', async () => {
   const file = fileInput.files && fileInput.files[0];
   if (!file) {
@@ -30,7 +37,7 @@ btnExtract.addEventListener('click', async () => {
   }
 
   btnExtract.disabled = true;
-  btnRun.disabled = true;
+  setStep2Enabled(false);
   setStatus('Extracting PIN…');
 
   try {
@@ -42,19 +49,21 @@ btnExtract.addEventListener('click', async () => {
 
     if (!res.ok || !data.ok) {
       setStatus(data.detail || data.error || 'Extraction failed.');
-      step2.style.display = 'none';
+      pinInput.value = '';
       return;
     }
 
-    pinInput.value = (data.nmc_pin || '').toUpperCase();
-    step2.style.display = 'block';
-    setStatus('PIN extracted. Please review/edit, then run the check.');
+    const pin = (data.nmc_pin || '').trim().toUpperCase();
+    pinInput.value = pin;
+    setStep2Enabled(true);
+
+    setStatus(pin ? 'PIN extracted. Please review/edit it, then run the check.' : 'No PIN found. Please enter manually and run.');
+    if (!pin) pinInput.focus();
   } catch (e) {
     setStatus('Extraction error: ' + (e?.message || e));
-    step2.style.display = 'none';
+    pinInput.value = '';
   } finally {
     btnExtract.disabled = false;
-    btnRun.disabled = false;
   }
 });
 
@@ -62,11 +71,12 @@ btnRun.addEventListener('click', async () => {
   const pin = (pinInput.value || '').trim().toUpperCase();
   if (!pin) {
     setStatus('Please enter an NMC PIN.');
+    pinInput.focus();
     return;
   }
 
   btnExtract.disabled = true;
-  btnRun.disabled = true;
+  setStep2Enabled(false);
   setStatus('Running NMC check… (this may take a moment)');
 
   try {
@@ -77,11 +87,10 @@ btnRun.addEventListener('click', async () => {
     });
 
     if (!res.ok) {
-      // try read JSON error
       const err = await res.json().catch(() => null);
       setStatus(err?.detail || 'Run failed.');
       btnExtract.disabled = false;
-      btnRun.disabled = false;
+      setStep2Enabled(true);
       return;
     }
 
@@ -90,11 +99,12 @@ btnRun.addEventListener('click', async () => {
     const match = /filename="?([^"]+)"?/i.exec(cd);
     const filename = match ? match[1] : 'NMC-Result.pdf';
     downloadBlob(blob, filename);
+
     setStatus('Done. PDF downloaded.');
   } catch (e) {
     setStatus('Run error: ' + (e?.message || e));
   } finally {
     btnExtract.disabled = false;
-    btnRun.disabled = false;
+    setStep2Enabled(true);
   }
 });
