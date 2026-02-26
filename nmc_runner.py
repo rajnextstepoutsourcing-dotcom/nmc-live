@@ -122,6 +122,7 @@ async def run_nmc_check_and_download_pdf(
                 [
                     "#onetrust-accept-btn-handler",
                     "button:has-text('Accept all cookies')",
+                    "button:has-text('I agree to all cookies')",
                     "button:has-text('Accept cookies')",
                     "button:has-text('Accept all')",
                 ],

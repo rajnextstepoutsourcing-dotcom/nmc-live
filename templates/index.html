@@ -4,31 +4,51 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>NMC Live Check</title>
-  <link rel="stylesheet" href="/static/styles.css?v=1" />
+  <link rel="stylesheet" href="/static/styles.css?v=2" />
 </head>
 <body>
   <div class="container">
     <h1>NMC Live Check</h1>
-    <p class="muted">Upload an NMC document and download the register PDF.</p>
+    <p class="muted">Upload an NMC document, extract the PIN, review/edit it, then download the register PDF.</p>
 
+    <!-- Step 1 -->
     <section class="card">
+      <h2 class="h2">Step 1 — Upload NMC document</h2>
       <label class="block">
         NMC document (PDF / JPG / PNG)
         <input id="file" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" />
       </label>
 
       <div class="actions">
-        <button id="btn" class="primary">Run & Download PDF</button>
+        <button id="btnExtract" class="primary">Extract PIN</button>
       </div>
 
-      <div id="status" class="status muted"></div>
+      <div id="status" class="status muted">Waiting…</div>
+    </section>
+
+    <!-- Step 2 -->
+    <section class="card" id="step2" style="display:none;">
+      <h2 class="h2">Step 2 — Extracted PIN (editable)</h2>
+
+      <label class="block">
+        NMC PIN
+        <input id="pin" type="text" placeholder="e.g. 12A3456S" />
+      </label>
+
+      <div class="actions">
+        <button id="btnRun" class="primary">Run NMC Check & Download PDF</button>
+      </div>
+
+      <p class="muted small">
+        If the website blocks access (CAPTCHA / bot check) you will still receive an error PDF explaining what happened.
+      </p>
     </section>
 
     <footer class="muted small">
-      If the document is unclear or the website blocks access, you will still receive a PDF explaining the issue.
+      Tip: If you ever see “Please verify you are not a robot”, accept the website cookies first.
     </footer>
   </div>
 
-  <script src="/static/app.js?v=1"></script>
+  <script src="/static/app.js?v=2"></script>
 </body>
 </html>
