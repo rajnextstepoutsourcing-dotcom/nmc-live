@@ -1,22 +1,26 @@
-"""NMC runner
-
-Goals
-- Compatible with existing app.py call:
-    await run_nmc_check_and_download_pdf(nmc_pin=pin, out_dir=str(job_dir))
-- Always return a PDF path (official PDF on success; otherwise a screenshot+diagnostic PDF)
-- Best-effort cookie acceptance, PIN entry, search, view details, download PDF
-
-Note: NMC may trigger bot protection / CAPTCHA on server IPs. In that case we return a
-screenshot PDF of the blocking page so the user can see exactly why it stopped.
 """
+nmc_runner.py
 
+Goal:
+- Run NMC register search by PIN
+- Best-effort: accept cookies, fill PIN, click Search, click View details, download official PDF
+- If anything fails: return a PDF snapshot of the page (via Playwright page.pdf) + an error PDF
+- Compatible with app.py calling: run_nmc_check_and_download_pdf(nmc_pin=..., out_dir=...)
+
+Notes:
+- We intentionally DO NOT stop early just because we see bot-protection text.
+  We only stop early if we detect an actual CAPTCHA widget (turnstile/hcaptcha/recaptcha) or if the form is disabled.
+"""
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+
+from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 
 from pdf_utils import make_simple_error_pdf
 
@@ -24,118 +28,210 @@ from pdf_utils import make_simple_error_pdf
 NMC_SEARCH_URL = "https://www.nmc.org.uk/registration/search-the-register/"
 
 
-def _now_ts() -> str:
+def _now_tag() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
 
+def _ensure_dir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def _safe_filename(s: str) -> str:
-    s = re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-")
+    s = re.sub(r"[^a-zA-Z0-9._-]+", "-", s).strip("-")
     return s or "file"
 
 
-def _write_screenshot_pdf(out_pdf: Path, screenshot_path: Path, title: str, lines: list[str]) -> None:
-    """Create a 2-page PDF:
-    - Page 1: screenshot scaled to fit A4
-    - Page 2: text diagnostics
+def _error_pdf(out_dir: Path, title: str, lines: list[str]) -> Path:
     """
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.utils import ImageReader
+    pdf_utils.make_simple_error_pdf(out_path, title, lines)
+    """
+    _ensure_dir(out_dir)
+    pdf_path = out_dir / f"NMC-Error-{_now_tag()}.pdf"
+    make_simple_error_pdf(pdf_path, title, lines)
+    return pdf_path
 
-    out_pdf.parent.mkdir(parents=True, exist_ok=True)
 
-    c = canvas.Canvas(str(out_pdf), pagesize=A4)
-    width, height = A4
+async def _page_snapshot_pdf(page, out_dir: Path, prefix: str) -> Optional[Path]:
+    """
+    Best effort: generate a PDF of the currently rendered page using Chromium's print-to-PDF.
+    This is perfect for 'why did it stop' debugging.
 
-    # Page 1: screenshot
+    Returns path if created, else None.
+    """
+    _ensure_dir(out_dir)
+    pdf_path = out_dir / f"{_safe_filename(prefix)}-{_now_tag()}.pdf"
     try:
-        img = ImageReader(str(screenshot_path))
-        iw, ih = img.getSize()
-        # Fit with margins
-        max_w = width - 48
-        max_h = height - 96
-        scale = min(max_w / iw, max_h / ih)
-        dw = iw * scale
-        dh = ih * scale
-        x = (width - dw) / 2
-        y = (height - dh) / 2
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(24, height - 32, title)
-        c.drawImage(img, x, y, width=dw, height=dh, preserveAspectRatio=True, mask='auto')
-        c.showPage()
-    except Exception:
-        # If image embedding fails, still produce a text PDF.
-        c.setFont("Helvetica-Bold", 16)
-        c.drawString(72, height - 72, title)
-        c.setFont("Helvetica", 11)
-        c.drawString(72, height - 100, f"Screenshot could not be embedded: {screenshot_path.name}")
-        c.showPage()
-
-    # Page 2: diagnostics text
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(72, height - 72, title)
-    y = height - 104
-    c.setFont("Helvetica", 11)
-    for ln in lines:
-        for wrapped in _wrap(ln, 95):
-            c.drawString(72, y, wrapped)
-            y -= 16
-            if y < 72:
-                c.showPage()
-                y = height - 72
-                c.setFont("Helvetica", 11)
-    c.showPage()
-    c.save()
-
-
-def _wrap(text: str, max_chars: int) -> list[str]:
-    if len(text) <= max_chars:
-        return [text]
-    words = text.split()
-    out: list[str] = []
-    cur = ""
-    for w in words:
-        if not cur:
-            cur = w
-        elif len(cur) + 1 + len(w) <= max_chars:
-            cur += " " + w
-        else:
-            out.append(cur)
-            cur = w
-    if cur:
-        out.append(cur)
-    return out
-
-
-def _make_error_pdf(out_dir: Path, title: str, message: str, *, pin: str, stage: str, screenshot: Optional[Path] = None) -> Dict[str, Any]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    base = _safe_filename(f"NMC-{stage}-{_now_ts()}")
-
-    if screenshot and screenshot.exists():
-        pdf_path = out_dir / f"{base}.pdf"
-        _write_screenshot_pdf(
-            pdf_path,
-            screenshot,
-            title,
-            [
-                f"PIN: {pin}",
-                f"Stage: {stage}",
-                message,
-                "",
-                "If you see bot protection / CAPTCHA, the service cannot complete the check automatically.",
-                "You can open the NMC register page manually, accept cookies, solve CAPTCHA (if shown), search the PIN, and download the PDF.",
-            ],
+        await page.pdf(
+            path=str(pdf_path),
+            format="A4",
+            print_background=True,
+            margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"},
         )
-        return {"ok": False, "pdf_path": str(pdf_path), "error": message, "stage": stage}
+        if pdf_path.exists() and pdf_path.stat().st_size > 0:
+            return pdf_path
+    except Exception:
+        # Fallback: try screenshot to help log, but still return None if PDF can't be made.
+        try:
+            await page.screenshot(path=str(out_dir / f"{_safe_filename(prefix)}-{_now_tag()}.png"), full_page=True)
+        except Exception:
+            pass
+    return None
 
-    # Fallback: plain text PDF
-    pdf_path = out_dir / f"{base}.pdf"
-    make_simple_error_pdf(
-        pdf_path,
-        title,
-        [f"PIN: {pin}", f"Stage: {stage}", message],
-    )
-    return {"ok": False, "pdf_path": str(pdf_path), "error": message, "stage": stage}
+
+async def _click_any(page, selectors: list[str], timeout_ms: int = 2500) -> bool:
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count():
+                await loc.click(timeout=timeout_ms)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _accept_cookies(page) -> None:
+    """
+    NMC uses cookie banners that vary (Cookiebot / OneTrust / custom).
+    We try multiple known accept buttons.
+    """
+    # Try a few times, banners can appear late.
+    for _ in range(4):
+        clicked = await _click_any(
+            page,
+            [
+                "button:has-text('I agree to all cookies')",
+                "button:has-text('Allow all cookies')",
+                "button:has-text('Accept all cookies')",
+                "button:has-text('Accept all')",
+                "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+                "#CybotCookiebotDialogBodyButtonAccept",
+                "button#onetrust-accept-btn-handler",
+                "button[aria-label*='Accept'][aria-label*='cookie' i]",
+                "button:has-text('Accept')",
+            ],
+            timeout_ms=2500,
+        )
+        if not clicked:
+            # Sometimes inside shadow/iframe; just wait a bit and try again
+            await page.wait_for_timeout(600)
+        else:
+            await page.wait_for_timeout(500)
+
+
+async def _detect_captcha_widget(page) -> bool:
+    """
+    Detect real CAPTCHA widgets (not just text).
+    """
+    patterns = [
+        "iframe[src*='captcha' i]",
+        "iframe[title*='captcha' i]",
+        "iframe[src*='hcaptcha' i]",
+        "iframe[src*='recaptcha' i]",
+        "div.g-recaptcha",
+        "[data-sitekey]",  # recaptcha/turnstile/hcaptcha
+        "iframe[src*='challenges.cloudflare.com' i]",  # Cloudflare Turnstile
+        "div[class*='turnstile' i]",
+        "div[id*='turnstile' i]",
+        "div[class*='hcaptcha' i]",
+    ]
+    try:
+        for sel in patterns:
+            if await page.locator(sel).count():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def _find_pin_input(page):
+    """
+    Locate the NMC PIN input field robustly.
+    """
+    candidates = [
+        "input[name*='pin' i]",
+        "input[id*='pin' i]",
+        "input[aria-label*='pin' i]",
+        "input[placeholder*='pin' i]",
+        "input[type='text']",
+        "input[type='search']",
+    ]
+    for sel in candidates:
+        loc = page.locator(sel).first
+        try:
+            if await loc.count():
+                # Only accept visible/enabled inputs
+                if await loc.is_visible() and await loc.is_enabled():
+                    return loc
+        except Exception:
+            continue
+    return None
+
+
+async def _fill_pin(page, pin: str) -> Tuple[bool, str]:
+    """
+    Fill pin and verify value.
+    Returns (ok, observed_value).
+    """
+    pin = (pin or "").strip()
+    loc = await _find_pin_input(page)
+    if not loc:
+        return False, ""
+    try:
+        await loc.scroll_into_view_if_needed()
+    except Exception:
+        pass
+
+    # Try fill strategies
+    for _ in range(3):
+        try:
+            await loc.click(timeout=2000)
+            await loc.fill("", timeout=2000)
+            await loc.type(pin, delay=50)  # human-like
+            await page.wait_for_timeout(200)
+            val = (await loc.input_value()) if hasattr(loc, "input_value") else ""
+            if val and pin.replace(" ", "") in val.replace(" ", ""):
+                return True, val
+        except Exception:
+            await page.wait_for_timeout(250)
+
+    # Last resort: evaluate set value
+    try:
+        await page.evaluate(
+            """([el, v]) => { el.value = v; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }""",
+            [loc, pin],
+        )
+        await page.wait_for_timeout(200)
+        val = await loc.input_value()
+        if val and pin.replace(" ", "") in val.replace(" ", ""):
+            return True, val
+        return False, val
+    except Exception:
+        return False, ""
+
+
+async def _click_search(page) -> bool:
+    """
+    Click the search/submit button.
+    """
+    # Prefer a button with Search text.
+    selectors = [
+        "button:has-text('Search')",
+        "input[type='submit'][value*='Search' i]",
+        "button[type='submit']",
+        "form button",
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                if await loc.is_enabled():
+                    await loc.click(timeout=4000)
+                    return True
+        except Exception:
+            continue
+    return False
 
 
 async def run_nmc_check_and_download_pdf(
@@ -143,258 +239,197 @@ async def run_nmc_check_and_download_pdf(
     out_dir: Optional[str] = None,
     output_dir: Optional[str] = None,
     output_pdf_path: Optional[str] = None,
-    **_: Any,
+    **kwargs,
 ) -> Dict[str, Any]:
-    """Run the NMC register search and download the official PDF.
+    """
+    Returns:
+      { ok: bool, pdf_path: str, error: str, stage: str }
 
     Compatibility:
-    - app.py passes out_dir=...
+      app.py may call with out_dir=...
     """
+    pin = (nmc_pin or "").strip()
+    out_path_dir = Path(out_dir or output_dir or "output")
+    _ensure_dir(out_path_dir)
 
-    pin = (nmc_pin or "").strip().upper()
+    # If app passes a full pdf path, honor it (best effort)
+    forced_pdf_path = Path(output_pdf_path) if output_pdf_path else None
 
-    # Resolve output directory
-    if output_pdf_path:
-        out_path_dir = Path(output_pdf_path).expanduser().resolve().parent
-        official_pdf_path = Path(output_pdf_path).expanduser().resolve()
-    else:
-        chosen_dir = out_dir or output_dir or os.getenv("OUTPUT_DIR") or "./data"
-        out_path_dir = Path(chosen_dir).expanduser().resolve()
-        official_pdf_path = out_path_dir / f"NMC-Register-{_safe_filename(pin)}-{_now_ts()}.pdf"
-
-    out_path_dir.mkdir(parents=True, exist_ok=True)
-
-    screenshot_path = out_path_dir / f"nmc-debug-{_safe_filename(pin)}-{_now_ts()}.png"
-
-    # Lazy import so web service can boot even if playwright deps are missing
-    try:
-        from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-    except Exception as e:
-        return _make_error_pdf(
-            out_path_dir,
-            "NMC Check Failed",
-            f"Playwright import failed: {e}",
-            pin=pin,
-            stage="startup",
-        )
-
-    async def _maybe_click_cookie_buttons(page) -> None:
-        # Cookiebot common IDs
-        candidates = [
-            "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
-            "#CybotCookiebotDialogBodyButtonAccept",
-            "button:has-text('I agree')",
-            "button:has-text('Allow all')",
-            "button:has-text('Accept all')",
-            "button:has-text('Accept All')",
-            "button:has-text('Accept cookies')",
-            "button:has-text('Accept Cookies')",
-            "button[aria-label*='Accept' i]",
-            "button#onetrust-accept-btn-handler",
-        ]
-        for sel in candidates:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count():
-                    if await loc.is_visible():
-                        await loc.click(timeout=1500)
-                        await page.wait_for_timeout(500)
-            except Exception:
-                pass
-
-    async def _detect_bot(page) -> Optional[str]:
-        txt = (await page.content()).lower()
-        # quick checks
-        bot_phrases = [
-            "please verify you are not a robot",
-            "verify you are human",
-            "bot",
-            "captcha",
-            "enable cookies",
-        ]
-        for p in bot_phrases:
-            if p in txt:
-                return p
-        return None
-
+    stage = "start"
     try:
         async with async_playwright() as p:
+            # Use chromium
             browser = await p.chromium.launch(
                 headless=True,
                 args=[
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
                 ],
             )
-            context = await browser.new_context(accept_downloads=True)
+            context = await browser.new_context(
+                accept_downloads=True,
+                viewport={"width": 1280, "height": 720},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                locale="en-GB",
+            )
             page = await context.new_page()
 
-            # Human-ish pacing
-            page.set_default_timeout(30000)
-
-            await page.goto(NMC_SEARCH_URL, wait_until="domcontentloaded")
+            stage = "landing"
+            await page.goto(NMC_SEARCH_URL, wait_until="domcontentloaded", timeout=45000)
             await page.wait_for_timeout(1200)
-            await _maybe_click_cookie_buttons(page)
+
+            # Cookies first
+            await _accept_cookies(page)
             await page.wait_for_timeout(800)
 
-            bot = await _detect_bot(page)
-            if bot:
-                await page.screenshot(path=str(screenshot_path), full_page=True)
-                await browser.close()
-                return _make_error_pdf(out_path_dir, "NMC Check Blocked", f"Blocked by bot protection: {bot}", pin=pin, stage="landing", screenshot=screenshot_path)
+            # If there's an actual captcha widget, stop and return snapshot PDF.
+            if await _detect_captcha_widget(page):
+                snap = await _page_snapshot_pdf(page, out_path_dir, "NMC-captcha")
+                if snap:
+                    return {"ok": False, "pdf_path": str(snap), "error": "CAPTCHA widget detected", "stage": "captcha"}
+                err = _error_pdf(
+                    out_path_dir,
+                    "NMC Check Blocked",
+                    [f"PIN: {pin}", "Stage: captcha", "CAPTCHA widget detected on the page."],
+                )
+                return {"ok": False, "pdf_path": str(err), "error": "CAPTCHA widget detected", "stage": "captcha"}
 
-            # Find PIN input
-            pin_selectors = [
-                "input[name*='pin' i]",
-                "input[id*='pin' i]",
-                "input[placeholder*='pin' i]",
-                "input[aria-label*='pin' i]",
-                "input[name*='registration' i]",
-                "input[id*='registration' i]",
-            ]
-            pin_input = None
-            for sel in pin_selectors:
-                try:
-                    loc = page.locator(sel).first
-                    if await loc.count() and await loc.is_visible():
-                        pin_input = loc
-                        break
-                except Exception:
-                    continue
-
-            if pin_input is None:
-                await page.screenshot(path=str(screenshot_path), full_page=True)
-                await browser.close()
-                return _make_error_pdf(out_path_dir, "NMC Check Failed", "Could not find PIN input field on the page.", pin=pin, stage="find_pin", screenshot=screenshot_path)
-
-            # Fill PIN and verify
-            await pin_input.click()
-            await pin_input.fill("")
-            await page.wait_for_timeout(200)
-            await pin_input.type(pin, delay=60)
-            await page.wait_for_timeout(300)
-
-            try:
-                filled_val = (await pin_input.input_value()).strip().upper()
-            except Exception:
-                filled_val = ""
-
-            if filled_val != pin:
-                await page.screenshot(path=str(screenshot_path), full_page=True)
-                await browser.close()
-                return _make_error_pdf(
+            # Fill PIN (DO NOT stop just because bot-protection text exists)
+            stage = "fill"
+            ok_fill, observed = await _fill_pin(page, pin)
+            if not ok_fill:
+                snap = await _page_snapshot_pdf(page, out_path_dir, "NMC-no-pin-field")
+                if snap:
+                    return {
+                        "ok": False,
+                        "pdf_path": str(snap),
+                        "error": "Could not locate/fill PIN input field",
+                        "stage": "fill",
+                    }
+                err = _error_pdf(
                     out_path_dir,
                     "NMC Check Failed",
-                    f"PIN did not stick in the input. Expected '{pin}', found '{filled_val}'.",
-                    pin=pin,
-                    stage="fill_pin",
-                    screenshot=screenshot_path,
+                    [f"PIN: {pin}", "Stage: fill", "Could not locate/fill the PIN input field."],
                 )
-
-            await _maybe_click_cookie_buttons(page)
+                return {"ok": False, "pdf_path": str(err), "error": "PIN fill failed", "stage": "fill"}
 
             # Click Search
-            search_selectors = [
-                "button:has-text('Search')",
-                "input[type='submit'][value*='Search' i]",
-                "button[type='submit']",
-                "button:has-text('Find')",
-            ]
-            clicked = False
-            for sel in search_selectors:
-                try:
-                    loc = page.locator(sel).first
-                    if await loc.count() and await loc.is_visible():
-                        await loc.click()
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-
+            stage = "search"
+            clicked = await _click_search(page)
             if not clicked:
-                await page.screenshot(path=str(screenshot_path), full_page=True)
-                await browser.close()
-                return _make_error_pdf(out_path_dir, "NMC Check Failed", "Could not find/click the Search button.", pin=pin, stage="click_search", screenshot=screenshot_path)
-
-            # Wait for results / view details or bot
-            await page.wait_for_timeout(1500)
-            await _maybe_click_cookie_buttons(page)
-
-            # If bot appears after search
-            bot2 = await _detect_bot(page)
-            if bot2:
-                await page.screenshot(path=str(screenshot_path), full_page=True)
-                await browser.close()
-                return _make_error_pdf(out_path_dir, "NMC Check Blocked", f"Blocked after search: {bot2}", pin=pin, stage="after_search", screenshot=screenshot_path)
-
-            # Try to open "View details"
-            view_selectors = [
-                "a:has-text('View details')",
-                "a:has-text('View Details')",
-                "button:has-text('View details')",
-            ]
-            opened = False
-            for sel in view_selectors:
+                # sometimes form needs enter key
                 try:
-                    loc = page.locator(sel).first
-                    if await loc.count() and await loc.is_visible():
-                        await loc.click()
-                        opened = True
-                        break
+                    await page.keyboard.press("Enter")
+                    clicked = True
                 except Exception:
-                    continue
+                    clicked = False
 
-            if not opened:
-                # Could be "no results" or different layout
-                await page.screenshot(path=str(screenshot_path), full_page=True)
-                await browser.close()
-                return _make_error_pdf(out_path_dir, "NMC Check Not Completed", "Could not reach the details page (no results or page layout changed).", pin=pin, stage="view_details", screenshot=screenshot_path)
+            # Wait for results to change
+            await page.wait_for_timeout(1500)
+
+            # If captcha widget appears after search, snapshot and stop
+            if await _detect_captcha_widget(page):
+                snap = await _page_snapshot_pdf(page, out_path_dir, "NMC-captcha-after-search")
+                if snap:
+                    return {"ok": False, "pdf_path": str(snap), "error": "CAPTCHA after search", "stage": "captcha"}
+                err = _error_pdf(
+                    out_path_dir,
+                    "NMC Check Blocked",
+                    [f"PIN: {pin}", "Stage: captcha", "CAPTCHA appeared after clicking Search."],
+                )
+                return {"ok": False, "pdf_path": str(err), "error": "CAPTCHA after search", "stage": "captcha"}
+
+            # Look for "View details" (or similar)
+            stage = "results"
+            view_loc = page.locator("a:has-text('View details'), button:has-text('View details')").first
+            try:
+                await view_loc.wait_for(timeout=12000)
+                await view_loc.click(timeout=6000)
+            except Exception:
+                # Maybe no results / still on same page
+                snap = await _page_snapshot_pdf(page, out_path_dir, "NMC-results-not-found")
+                if snap:
+                    return {
+                        "ok": False,
+                        "pdf_path": str(snap),
+                        "error": "Could not find 'View details' after search",
+                        "stage": "results",
+                    }
+                err = _error_pdf(
+                    out_path_dir,
+                    "NMC Check Failed",
+                    [
+                        f"PIN: {pin}",
+                        "Stage: results",
+                        f"PIN filled as: {observed}",
+                        "Could not find 'View details' after clicking Search.",
+                    ],
+                )
+                return {"ok": False, "pdf_path": str(err), "error": "No view details", "stage": "results"}
 
             await page.wait_for_timeout(1200)
-            await _maybe_click_cookie_buttons(page)
 
             # Download PDF
-            download_selectors = [
+            stage = "download"
+            dl_selectors = [
                 "a:has-text('Download PDF')",
-                "a:has-text('Download pdf')",
                 "button:has-text('Download PDF')",
-                "a[href*='pdf' i]:has-text('Download')",
+                "a[href*='.pdf' i]:has-text('Download')",
+                "a:has-text('Download')",
             ]
 
-            download_clicked = False
-            for sel in download_selectors:
+            # Sometimes it opens in same tab; prefer expect_download
+            downloaded_path: Optional[Path] = None
+            for sel in dl_selectors:
                 try:
                     loc = page.locator(sel).first
                     if await loc.count() and await loc.is_visible():
-                        async with page.expect_download(timeout=30000) as dl_info:
-                            await loc.click()
+                        async with page.expect_download(timeout=20000) as dl_info:
+                            await loc.click(timeout=8000)
                         download = await dl_info.value
-                        await download.save_as(str(official_pdf_path))
-                        download_clicked = True
+                        suggested = download.suggested_filename or "nmc-register.pdf"
+                        target_dir = _ensure_dir(out_path_dir)
+                        target_path = forced_pdf_path or (target_dir / _safe_filename(suggested))
+                        await download.save_as(str(target_path))
+                        downloaded_path = target_path
                         break
-                except PWTimeout:
+                except PWTimeoutError:
                     continue
                 except Exception:
                     continue
 
-            if not download_clicked:
-                await page.screenshot(path=str(screenshot_path), full_page=True)
+            if downloaded_path and downloaded_path.exists() and downloaded_path.stat().st_size > 0:
+                await context.close()
                 await browser.close()
-                return _make_error_pdf(out_path_dir, "NMC PDF Not Downloaded", "Could not find or download the official PDF on the details page.", pin=pin, stage="download_pdf", screenshot=screenshot_path)
+                return {"ok": True, "pdf_path": str(downloaded_path), "error": "", "stage": "download"}
 
+            # If no download event, try print-to-pdf of details page as fallback (still useful)
+            snap = await _page_snapshot_pdf(page, out_path_dir, "NMC-details")
+            await context.close()
             await browser.close()
-            return {"ok": True, "pdf_path": str(official_pdf_path), "error": None, "stage": "success", "pin": pin}
+
+            if snap:
+                return {
+                    "ok": False,
+                    "pdf_path": str(snap),
+                    "error": "Could not trigger official Download PDF; returned page snapshot PDF instead.",
+                    "stage": "download",
+                }
+
+            err = _error_pdf(
+                out_path_dir,
+                "NMC Check Failed",
+                [f"PIN: {pin}", "Stage: download", "Could not download official PDF and could not create page snapshot PDF."],
+            )
+            return {"ok": False, "pdf_path": str(err), "error": "Download failed", "stage": "download"}
 
     except Exception as e:
-        # Ensure we return a PDF even on unexpected exceptions.
-        try:
-            # If screenshot exists, include it
-            if screenshot_path.exists():
-                return _make_error_pdf(out_path_dir, "NMC Check Failed", f"Unexpected error: {e}", pin=pin, stage="exception", screenshot=screenshot_path)
-        except Exception:
-            pass
-
-        pdf_path = out_path_dir / f"NMC-Exception-{_safe_filename(pin)}-{_now_ts()}.pdf"
-        make_simple_error_pdf(pdf_path, "NMC Check Failed", [f"PIN: {pin}", f"Unexpected error: {e}"])
-        return {"ok": False, "pdf_path": str(pdf_path), "error": str(e), "stage": "exception"}
+        # Always return an error PDF (never raise to app)
+        err = _error_pdf(out_path_dir, "NMC Check Failed", [f"PIN: {pin}", "Stage: exception", f"Unexpected error: {e!r}"])
+        return {"ok": False, "pdf_path": str(err), "error": str(e), "stage": "exception"}
