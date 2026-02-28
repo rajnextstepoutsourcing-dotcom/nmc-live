@@ -1,11 +1,14 @@
-"""
-nmc_runner.py
+"""nmc_runner.py
+
 Playwright automation for NMC register search -> view details -> download PDF.
 
-Design goals:
-- Always return a PDF path (success PDF from NMC, or generated error PDF).
-- Accept cookies (Cookiebot / OneTrust / generic).
-- Detect bot protection / captcha pages and fail gracefully with error PDF.
+Key rules
+- Always return a PDF path (official PDF on success OR a generated error PDF)
+- Accept cookies (Cookiebot / OneTrust)
+- Detect bot protection / CAPTCHA and fail gracefully
+
+NOTE: This file is designed to work with the project's existing pdf_utils.py,
+which provides: make_simple_error_pdf(out_path, title, lines)
 """
 
 from __future__ import annotations
@@ -18,9 +21,7 @@ from typing import Optional, Tuple
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-# Local PDF helper (your project already has pdf_utils.py)
-from pdf_utils import make_error_pdf
-
+from pdf_utils import make_simple_error_pdf
 
 NMC_SEARCH_URL = "https://www.nmc.org.uk/registration/search-the-register/"
 
@@ -29,9 +30,9 @@ def _safe_slug(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")[:80] or "nmc"
 
 
-def _tmp_pdf_path(prefix: str) -> str:
+def _tmp_pdf_path(prefix: str) -> Path:
     tmpdir = Path(tempfile.gettempdir())
-    return str(tmpdir / f"{_safe_slug(prefix)}-{int(time.time())}.pdf")
+    return tmpdir / f"{_safe_slug(prefix)}-{int(time.time())}.pdf"
 
 
 def _click_if_visible(page, selector: str, timeout_ms: int = 2000) -> bool:
@@ -46,19 +47,19 @@ def _click_if_visible(page, selector: str, timeout_ms: int = 2000) -> bool:
 
 
 def _accept_cookies(page) -> bool:
-    """Attempts to accept cookies on NMC pages."""
+    """Best-effort cookie accept for Cookiebot/OneTrust and common banners."""
     candidates = [
         "button:has-text('I agree to all cookies')",
         "button:has-text('I agree')",
+        "button#onetrust-accept-btn-handler",
         "button:has-text('Accept all')",
         "button:has-text('Accept All')",
         "button:has-text('Accept')",
-        "button#onetrust-accept-btn-handler",
-        "button[aria-label*='Accept']",
+        "button[aria-label*='Accept' i]",
         "text=I agree to all cookies",
     ]
 
-    # Sometimes banner is in an iframe
+    # Sometimes banner is inside an iframe
     try:
         for frame in page.frames:
             for sel in candidates:
@@ -83,6 +84,7 @@ def _is_bot_block(page) -> bool:
         txt = (page.content() or "").lower()
     except Exception:
         txt = ""
+
     needles = [
         "please verify you are not a robot",
         "verify you are human",
@@ -96,7 +98,7 @@ def _is_bot_block(page) -> bool:
 
 def _find_pin_input(page):
     """Find the PIN input on the Search the register page."""
-    # Prefer input near label text
+    # Try near the label first
     try:
         label = page.locator("text=Pin number").first
         if label.is_visible(timeout=1500):
@@ -109,11 +111,12 @@ def _find_pin_input(page):
     selectors = [
         "input[name*='pin' i]",
         "input[id*='pin' i]",
-        "input[aria-label*='Pin' i]",
-        "input[placeholder*='Pin' i]",
+        "input[aria-label*='pin' i]",
+        "input[placeholder*='pin' i]",
         "input[type='search']",
         "input[type='text']",
     ]
+
     for sel in selectors:
         try:
             loc = page.locator(sel).first
@@ -121,11 +124,12 @@ def _find_pin_input(page):
                 return loc
         except Exception:
             continue
+
     return None
 
 
 def _fill_pin(page, pin: str) -> Tuple[bool, str]:
-    pin = pin.strip()
+    pin = (pin or "").strip().upper()
     inp = _find_pin_input(page)
     if inp is None:
         return False, "PIN input not found"
@@ -133,15 +137,16 @@ def _fill_pin(page, pin: str) -> Tuple[bool, str]:
     try:
         inp.click()
         inp.fill("")
-        inp.type(pin, delay=50)
+        inp.type(pin, delay=40)
 
-        val = inp.input_value()
-        if (val or "").strip().upper() == pin.upper():
+        val = (inp.input_value() or "").strip().upper()
+        if val == pin:
             return True, "PIN filled"
 
+        # fallback
         inp.fill(pin)
-        val2 = inp.input_value()
-        if (val2 or "").strip().upper() == pin.upper():
+        val2 = (inp.input_value() or "").strip().upper()
+        if val2 == pin:
             return True, "PIN filled"
 
         return False, f"PIN fill did not stick (value='{val2}')"
@@ -161,12 +166,13 @@ def _click_search(page) -> bool:
     return False
 
 
-def _wait_for_results(page, timeout_ms: int = 15000) -> bool:
+def _wait_for_results(page, timeout_ms: int = 20000) -> bool:
     targets = [
-        "text=Search results",
         "a:has-text('View details')",
+        "text=Search results",
         "text=View details",
     ]
+
     end = time.time() + timeout_ms / 1000
     while time.time() < end:
         if _is_bot_block(page):
@@ -178,15 +184,12 @@ def _wait_for_results(page, timeout_ms: int = 15000) -> bool:
             except Exception:
                 pass
         time.sleep(0.4)
+
     return False
 
 
 def _open_first_result(page) -> bool:
-    selectors = [
-        "a:has-text('View details')",
-        "a:has-text('View Details')",
-    ]
-    for sel in selectors:
+    for sel in ["a:has-text('View details')", "a:has-text('View Details')"]:
         try:
             loc = page.locator(sel).first
             if loc.count() > 0 and loc.is_visible(timeout=3000):
@@ -197,13 +200,14 @@ def _open_first_result(page) -> bool:
     return False
 
 
-def _download_pdf_from_details(page, output_pdf_path: str, timeout_ms: int = 25000) -> Tuple[bool, str]:
+def _download_pdf_from_details(page, output_pdf_path: Path, timeout_ms: int = 30000) -> Tuple[bool, str]:
     selectors = [
         "a:has-text('Download PDF')",
         "button:has-text('Download PDF')",
         "a[download]",
         "a[href$='.pdf']",
     ]
+
     try:
         with page.expect_download(timeout=timeout_ms) as dl_info:
             clicked = False
@@ -216,12 +220,14 @@ def _download_pdf_from_details(page, output_pdf_path: str, timeout_ms: int = 250
                         break
                 except Exception:
                     continue
+
             if not clicked:
                 return False, "Download PDF control not found"
 
         download = dl_info.value
-        download.save_as(output_pdf_path)
+        download.save_as(str(output_pdf_path))
         return True, "PDF downloaded"
+
     except PWTimeoutError:
         return False, "Timed out waiting for PDF download"
     except Exception as e:
@@ -229,9 +235,17 @@ def _download_pdf_from_details(page, output_pdf_path: str, timeout_ms: int = 250
 
 
 def run_nmc_check_and_download_pdf(nmc_pin: str, output_pdf_path: Optional[str] = None) -> str:
-    """Main entry used by app.py. Returns a PDF path."""
-    if not output_pdf_path:
-        output_pdf_path = _tmp_pdf_path(f"nmc-{nmc_pin}")
+    """Returns a path to a PDF.
+
+    On success: official NMC PDF saved to output_pdf_path
+    On failure: generated error PDF saved to output_pdf_path
+    """
+
+    out_path = Path(output_pdf_path) if output_pdf_path else _tmp_pdf_path(f"nmc-{nmc_pin}")
+
+    def _err(title: str, lines: list[str]) -> str:
+        make_simple_error_pdf(out_path, title=title, lines=lines)
+        return str(out_path)
 
     try:
         with sync_playwright() as p:
@@ -244,58 +258,49 @@ def run_nmc_check_and_download_pdf(nmc_pin: str, output_pdf_path: Optional[str] 
             _accept_cookies(page)
 
             if _is_bot_block(page):
-                make_error_pdf(
-                    output_pdf_path,
-                    title="NMC check blocked by bot protection",
-                    lines=[
+                return _err(
+                    "NMC check blocked by bot protection",
+                    [
                         "The NMC website displayed bot verification (e.g., Please verify you are not a robot).",
                         "Try again later or complete the check manually.",
                         f"NMC PIN: {nmc_pin}",
                         f"URL: {NMC_SEARCH_URL}",
                     ],
                 )
-                return output_pdf_path
 
             ok, msg = _fill_pin(page, nmc_pin)
             if not ok:
-                make_error_pdf(output_pdf_path, title="NMC check failed", lines=[msg, f"NMC PIN: {nmc_pin}", f"URL: {NMC_SEARCH_URL}"])
-                return output_pdf_path
+                return _err("NMC check failed", [msg, f"NMC PIN: {nmc_pin}", f"URL: {NMC_SEARCH_URL}"])
 
             if not _click_search(page):
-                make_error_pdf(output_pdf_path, title="NMC check failed", lines=["Could not click Search button.", f"NMC PIN: {nmc_pin}", f"URL: {NMC_SEARCH_URL}"])
-                return output_pdf_path
+                return _err("NMC check failed", ["Could not click Search button.", f"NMC PIN: {nmc_pin}", f"URL: {NMC_SEARCH_URL}"])
 
             if not _wait_for_results(page, timeout_ms=20000):
                 if _is_bot_block(page):
-                    make_error_pdf(
-                        output_pdf_path,
-                        title="NMC check blocked by bot protection",
-                        lines=[
-                            "Bot verification appeared after clicking Search (Please verify you are not a robot).",
+                    return _err(
+                        "NMC check blocked by bot protection",
+                        [
+                            "Bot verification appeared after clicking Search.",
                             "Try again later, or complete the check manually on the NMC website.",
                             f"NMC PIN: {nmc_pin}",
                             f"URL: {NMC_SEARCH_URL}",
                         ],
                     )
-                else:
-                    make_error_pdf(output_pdf_path, title="NMC check failed", lines=["No results appeared after Search (timeout).", f"NMC PIN: {nmc_pin}", f"URL: {NMC_SEARCH_URL}"])
-                return output_pdf_path
+                return _err("NMC check failed", ["No results appeared after Search (timeout).", f"NMC PIN: {nmc_pin}", f"URL: {NMC_SEARCH_URL}"])
 
             _open_first_result(page)
-
             try:
                 page.wait_for_load_state("domcontentloaded", timeout=10000)
             except Exception:
                 pass
 
-            ok_dl, msg_dl = _download_pdf_from_details(page, output_pdf_path, timeout_ms=30000)
+            ok_dl, msg_dl = _download_pdf_from_details(page, out_path, timeout_ms=30000)
             if not ok_dl:
-                make_error_pdf(output_pdf_path, title="NMC check failed", lines=[msg_dl, f"NMC PIN: {nmc_pin}", f"URL: {page.url}"])
+                return _err("NMC check failed", [msg_dl, f"NMC PIN: {nmc_pin}", f"URL: {page.url}"])
 
             context.close()
             browser.close()
-            return output_pdf_path
+            return str(out_path)
 
     except Exception as e:
-        make_error_pdf(output_pdf_path, title="NMC automation error", lines=[f"Unexpected error: {e}", f"NMC PIN: {nmc_pin}", f"URL: {NMC_SEARCH_URL}"])
-        return output_pdf_path
+        return _err("NMC automation error", [f"Unexpected error: {e}", f"NMC PIN: {nmc_pin}", f"URL: {NMC_SEARCH_URL}"])
