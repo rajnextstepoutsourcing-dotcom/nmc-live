@@ -115,26 +115,47 @@ async def _save_shot(page, out_dir: Path, prefix: str, shots: List[Path]) -> Non
 
 
 async def _accept_cookies_and_wait_enable_pin(page, out_dir: Path, shots: List[Path]) -> None:
+    """Accept Cookiebot consent (if present) and wait until PIN input is enabled."""
     await _save_shot(page, out_dir, "01_before_cookies", shots)
 
     cookie_selectors = [
-        # Cookiebot allow-all button id (most reliable)
+        # Cookiebot common IDs (varies by site/config)
         "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
-        "button#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+        "#CybotCookiebotDialogBodyButtonAccept",
+        "#CybotCookiebotDialogBodyButtonAcceptAll",
+        "#CybotCookiebotDialogBodyLevelButtonAccept",
+
         # Text fallbacks
         "button:has-text('I agree to all cookies')",
+        "button:has-text('Agree to all cookies')",
         "button:has-text('Allow all')",
         "button:has-text('Accept all')",
+        "button:has-text('Accept')",
     ]
 
-    for sel in cookie_selectors:
-        loc = page.locator(sel).first
-        try:
-            if await loc.is_visible(timeout=1500):
-                await loc.click(timeout=8000, force=True)
-                break
-        except Exception:
-            continue
+    async def try_click_in_context(ctx) -> bool:
+        for sel in cookie_selectors:
+            loc = ctx.locator(sel).first
+            try:
+                if await loc.is_visible(timeout=1200):
+                    await loc.click(timeout=8000, force=True)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    # Try main page first
+    clicked = await try_click_in_context(page)
+
+    # Try iframes (Cookiebot sometimes renders inside a frame)
+    if not clicked:
+        for fr in page.frames:
+            try:
+                if await try_click_in_context(fr):
+                    clicked = True
+                    break
+            except Exception:
+                continue
 
     await page.wait_for_timeout(900)
     await _save_shot(page, out_dir, "02_after_cookie_click", shots)
@@ -142,10 +163,32 @@ async def _accept_cookies_and_wait_enable_pin(page, out_dir: Path, shots: List[P
     pin_loc = page.locator("#PinNumber").first
     await pin_loc.wait_for(state="visible", timeout=20000)
 
-    deadline = time.time() + 25
+    async def pin_enabled() -> bool:
+        cls = (await pin_loc.get_attribute("class")) or ""
+        dis = await pin_loc.get_attribute("disabled")
+        return (dis is None) and ("cookies-only-disabled" not in cls)
+
+    # First wait (~8s)
+    for _ in range(20):
+        try:
+            if await pin_enabled():
+                return
+        except Exception:
+            pass
+        await page.wait_for_timeout(400)
+
+    # If still blocked, reload (consent should persist)
+    await page.reload(wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(900)
+    await _save_shot(page, out_dir, "02b_after_reload", shots)
+
+    pin_loc = page.locator("#PinNumber").first
+    await pin_loc.wait_for(state="visible", timeout=20000)
+
+    # Second wait (~12s)
     last_class = ""
     last_disabled = None
-    while time.time() < deadline:
+    for _ in range(30):
         try:
             last_class = (await pin_loc.get_attribute("class")) or ""
             last_disabled = await pin_loc.get_attribute("disabled")
@@ -218,20 +261,41 @@ async def run_nmc_check_and_download_pdf(nmc_pin: str, out_dir: str):
             stage = "fill_pin"
             pin_input = page.locator("#PinNumber").first
             await pin_input.scroll_into_view_if_needed(timeout=8000)
+
+            # Type like a user (more reliable than fill on some cookie-gated/JS-heavy pages)
             await pin_input.click(timeout=20000, force=True)
-            await pin_input.fill(pin, timeout=20000)
+            try:
+                await pin_input.press("Control+A")
+            except Exception:
+                pass
+            await pin_input.type(pin, delay=60)
+
+            # Verify it actually went in; retry once if not
+            try:
+                val = await pin_input.input_value(timeout=2000)
+            except Exception:
+                val = ""
+
+            if (val or "").strip().upper() != pin:
+                await pin_input.click(timeout=10000, force=True)
+                try:
+                    await pin_input.press("Control+A")
+                except Exception:
+                    pass
+                await pin_input.type(pin, delay=80)
 
             try:
-                notes.append(f"PIN readback after fill: '{await pin_input.input_value(timeout=2000)}'")
+                notes.append(f"PIN readback after type: '{await pin_input.input_value(timeout=2000)}'")
             except Exception:
-                notes.append("PIN readback after fill: (failed to read)")
+                notes.append("PIN readback after type: (failed to read)")
 
             await _save_shot(page, out_dir_path, "03_after_pin_fill", shots)
 
             stage = "click_search"
             search_btn = page.get_by_role("button", name=re.compile(r"^Search$", re.I)).first
             await search_btn.scroll_into_view_if_needed(timeout=8000)
-            await search_btn.click(timeout=25000)
+            await search_btn.wait_for(state="visible", timeout=25000)
+            await search_btn.click(timeout=25000, force=True)
 
             await page.wait_for_timeout(1200)
             await _save_shot(page, out_dir_path, "04_after_search_click", shots)
