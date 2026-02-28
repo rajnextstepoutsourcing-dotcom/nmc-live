@@ -22,10 +22,51 @@ from typing import Any, Dict, Optional, Tuple
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 
-from pdf_utils import make_simple_error_pdf, make_debug_snapshot_pdf
+from pdf_utils import make_simple_error_pdf
 
 
 NMC_SEARCH_URL = "https://www.nmc.org.uk/registration/search-the-register/"
+def make_debug_snapshot_pdf(page, out_path: Path, title: str, lines: list[str]) -> None:
+    '''
+    Create a *true* visual snapshot PDF by taking a full-page screenshot and embedding it into a PDF.
+    This avoids Playwright's page.pdf() "print view", which often hides overlays/inputs.
+    '''
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1) Full-page screenshot (PNG)
+    png_path = out_path.with_suffix(".png")
+    try:
+        page.screenshot(path=str(png_path), full_page=True)
+    except Exception:
+        # If screenshot fails, fall back to print-PDF
+        try:
+            page.pdf(path=str(out_path), print_background=True)
+            return
+        except Exception:
+            make_simple_error_pdf(out_path, title, lines + ["(Also failed to capture screenshot or print-PDF.)"])
+            return
+
+    # 2) Convert PNG -> PDF (use PyMuPDF; avoids PIL dependency)
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open()
+        pix = fitz.Pixmap(str(png_path))
+        rect = fitz.Rect(0, 0, pix.width, pix.height)
+        p1 = doc.new_page(width=pix.width, height=pix.height)
+        p1.insert_image(rect, filename=str(png_path))
+
+        if lines:
+            w, h = 595, 842  # A4 points
+            p2 = doc.new_page(width=w, height=h)
+            text = title + "\n\n" + "\n".join(lines)
+            p2.insert_textbox(fitz.Rect(36, 36, w - 36, h - 36), text, fontsize=10)
+
+        doc.save(str(out_path))
+        doc.close()
+    except Exception:
+        make_simple_error_pdf(out_path, title, lines + [f"(Saved screenshot image at {png_path.name} but could not embed into PDF.)"])
+
 
 
 def _now_tag() -> str:
