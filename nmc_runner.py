@@ -22,7 +22,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 
-from pdf_utils import make_simple_error_pdf
+from pdf_utils import make_simple_error_pdf, make_debug_snapshot_pdf
 
 
 NMC_SEARCH_URL = "https://www.nmc.org.uk/registration/search-the-register/"
@@ -52,30 +52,82 @@ def _error_pdf(out_dir: Path, title: str, lines: list[str]) -> Path:
     return pdf_path
 
 
-async def _page_snapshot_pdf(page, out_dir: Path, prefix: str) -> Optional[Path]:
-    """
-    Best effort: generate a PDF of the currently rendered page using Chromium's print-to-PDF.
-    This is perfect for 'why did it stop' debugging.
+async def _capture_scroll_screenshots(page, out_dir: Path, prefix: str) -> list[Path]:
+    """Capture a *readable* full-page snapshot by taking multiple viewport screenshots.
 
-    Returns path if created, else None.
+    Why:
+      - page.pdf() is print-to-PDF (often hides overlays, typed values, widgets)
+      - a single full_page screenshot becomes unreadable when scaled onto A4
+
+    This function scrolls and captures the viewport repeatedly with slight overlap.
     """
     _ensure_dir(out_dir)
-    pdf_path = out_dir / f"{_safe_filename(prefix)}-{_now_tag()}.pdf"
+    shots: list[Path] = []
+
     try:
-        await page.pdf(
-            path=str(pdf_path),
-            format="A4",
-            print_background=True,
-            margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"},
+        viewport = page.viewport_size or {"width": 1280, "height": 720}
+        vw = int(viewport.get("width", 1280))
+        vh = int(viewport.get("height", 720))
+
+        # Best-effort total height
+        total_h = await page.evaluate(
+            """() => Math.max(
+              document.documentElement.scrollHeight,
+              document.body ? document.body.scrollHeight : 0,
+              document.documentElement.offsetHeight,
+              document.body ? document.body.offsetHeight : 0
+            )"""
         )
+        total_h = int(total_h) if total_h else vh
+
+        step = max(200, vh - 80)  # overlap for continuity
+        y = 0
+        idx = 1
+        max_pages = 18  # safety cap to avoid huge PDFs
+        while y < total_h and idx <= max_pages:
+            await page.evaluate("(yy) => window.scrollTo(0, yy)", y)
+            await page.wait_for_timeout(350)
+
+            img_path = out_dir / f"{_safe_filename(prefix)}-{_now_tag()}-{idx:02d}.png"
+            await page.screenshot(path=str(img_path), full_page=False)
+            if img_path.exists() and img_path.stat().st_size > 0:
+                shots.append(img_path)
+
+            y += step
+            idx += 1
+
+        # Return to top (helps if further actions happen)
+        try:
+            await page.evaluate("() => window.scrollTo(0, 0)")
+        except Exception:
+            pass
+    except Exception:
+        # Last resort: one full-page screenshot
+        try:
+            img_path = out_dir / f"{_safe_filename(prefix)}-{_now_tag()}-FULL.png"
+            await page.screenshot(path=str(img_path), full_page=True)
+            if img_path.exists() and img_path.stat().st_size > 0:
+                shots.append(img_path)
+        except Exception:
+            pass
+
+    return shots
+
+
+async def _full_page_snapshot_pdf(page, out_dir: Path, prefix: str, title: str, lines: list[str]) -> Optional[Path]:
+    """Create a *true* full-page snapshot PDF from screenshots (not print-to-PDF)."""
+    _ensure_dir(out_dir)
+    pdf_path = out_dir / f"{_safe_filename(prefix)}-{_now_tag()}.pdf"
+
+    shots = await _capture_scroll_screenshots(page, out_dir, prefix)
+    if not shots:
+        return None
+    try:
+        make_debug_snapshot_pdf(pdf_path, title, lines, shots)
         if pdf_path.exists() and pdf_path.stat().st_size > 0:
             return pdf_path
     except Exception:
-        # Fallback: try screenshot to help log, but still return None if PDF can't be made.
-        try:
-            await page.screenshot(path=str(out_dir / f"{_safe_filename(prefix)}-{_now_tag()}.png"), full_page=True)
-        except Exception:
-            pass
+        return None
     return None
 
 
@@ -149,13 +201,20 @@ async def _find_pin_input(page):
     """
     Locate the NMC PIN input field robustly.
     """
+    # Prefer accessible label-based selectors first.
+    try:
+        loc = page.get_by_label(re.compile(r"\bPIN\b", re.I)).first
+        if await loc.count() and await loc.is_visible() and await loc.is_enabled():
+            return loc
+    except Exception:
+        pass
+
     candidates = [
         "input[name*='pin' i]",
         "input[id*='pin' i]",
         "input[aria-label*='pin' i]",
         "input[placeholder*='pin' i]",
-        "input[type='text']",
-        "input[type='search']",
+        # Avoid generic input[type=text] fallbacks; they can target the wrong field.
     ]
     for sel in candidates:
         loc = page.locator(sel).first
@@ -216,11 +275,19 @@ async def _click_search(page) -> bool:
     Click the search/submit button.
     """
     # Prefer a button with Search text.
+    # Prefer ARIA role lookups to avoid clicking the wrong button.
+    try:
+        btn = page.get_by_role("button", name=re.compile(r"^Search$", re.I)).first
+        if await btn.count() and await btn.is_visible() and await btn.is_enabled():
+            await btn.click(timeout=6000)
+            return True
+    except Exception:
+        pass
+
     selectors = [
         "button:has-text('Search')",
         "input[type='submit'][value*='Search' i]",
         "button[type='submit']",
-        "form button",
     ]
     for sel in selectors:
         try:
@@ -234,13 +301,7 @@ async def _click_search(page) -> bool:
     return False
 
 
-async def run_nmc_check_and_download_pdf(
-    nmc_pin: str,
-    out_dir: Optional[str] = None,
-    output_dir: Optional[str] = None,
-    output_pdf_path: Optional[str] = None,
-    **kwargs,
-) -> Dict[str, Any]:
+async def run_nmc_check_and_download_pdf(nmc_pin: str, out_dir: str) -> Dict[str, Any]:
     """
     Returns:
       { ok: bool, pdf_path: str, error: str, stage: str }
@@ -249,11 +310,10 @@ async def run_nmc_check_and_download_pdf(
       app.py may call with out_dir=...
     """
     pin = (nmc_pin or "").strip()
-    out_path_dir = Path(out_dir or output_dir or "output")
+    out_path_dir = Path(out_dir or "output")
     _ensure_dir(out_path_dir)
 
-    # If app passes a full pdf path, honor it (best effort)
-    forced_pdf_path = Path(output_pdf_path) if output_pdf_path else None
+    forced_pdf_path = None  # keep runner signature strict (nmc_pin, out_dir)
 
     stage = "start"
     try:
@@ -290,7 +350,13 @@ async def run_nmc_check_and_download_pdf(
 
             # If there's an actual captcha widget, stop and return snapshot PDF.
             if await _detect_captcha_widget(page):
-                snap = await _page_snapshot_pdf(page, out_path_dir, "NMC-captcha")
+                snap = await _full_page_snapshot_pdf(
+                    page,
+                    out_path_dir,
+                    "NMC-captcha",
+                    "NMC Check Blocked",
+                    [f"PIN: {pin}", "Stage: captcha", "CAPTCHA widget detected on the page."],
+                )
                 if snap:
                     return {"ok": False, "pdf_path": str(snap), "error": "CAPTCHA widget detected", "stage": "captcha"}
                 err = _error_pdf(
@@ -304,7 +370,13 @@ async def run_nmc_check_and_download_pdf(
             stage = "fill"
             ok_fill, observed = await _fill_pin(page, pin)
             if not ok_fill:
-                snap = await _page_snapshot_pdf(page, out_path_dir, "NMC-no-pin-field")
+                snap = await _full_page_snapshot_pdf(
+                    page,
+                    out_path_dir,
+                    "NMC-no-pin-field",
+                    "NMC Check Failed",
+                    [f"PIN: {pin}", "Stage: fill", "Could not locate/fill the PIN input field."],
+                )
                 if snap:
                     return {
                         "ok": False,
@@ -335,7 +407,13 @@ async def run_nmc_check_and_download_pdf(
 
             # If captcha widget appears after search, snapshot and stop
             if await _detect_captcha_widget(page):
-                snap = await _page_snapshot_pdf(page, out_path_dir, "NMC-captcha-after-search")
+                snap = await _full_page_snapshot_pdf(
+                    page,
+                    out_path_dir,
+                    "NMC-captcha-after-search",
+                    "NMC Check Blocked",
+                    [f"PIN: {pin}", "Stage: captcha", "CAPTCHA appeared after clicking Search."],
+                )
                 if snap:
                     return {"ok": False, "pdf_path": str(snap), "error": "CAPTCHA after search", "stage": "captcha"}
                 err = _error_pdf(
@@ -353,7 +431,18 @@ async def run_nmc_check_and_download_pdf(
                 await view_loc.click(timeout=6000)
             except Exception:
                 # Maybe no results / still on same page
-                snap = await _page_snapshot_pdf(page, out_path_dir, "NMC-results-not-found")
+                snap = await _full_page_snapshot_pdf(
+                    page,
+                    out_path_dir,
+                    "NMC-results-not-found",
+                    "NMC Check Failed",
+                    [
+                        f"PIN: {pin}",
+                        "Stage: results",
+                        f"PIN filled as observed: {observed}",
+                        "Could not find 'View details' after clicking Search.",
+                    ],
+                )
                 if snap:
                     return {
                         "ok": False,
@@ -375,42 +464,143 @@ async def run_nmc_check_and_download_pdf(
 
             await page.wait_for_timeout(1200)
 
-            # Download PDF
+
+            # Download official PDF from the "Practitioner Details" modal
             stage = "download"
-            dl_selectors = [
-                "a:has-text('Download PDF')",
-                "button:has-text('Download PDF')",
-                "a[href*='.pdf' i]:has-text('Download')",
-                "a:has-text('Download')",
+
+            # Wait for the modal/popup to be visible (it appears after clicking "View details")
+            modal = page.locator("div[role='dialog'], .modal, [aria-modal='true']").first
+            try:
+                # Prefer heading text if present
+                await page.locator("text=Practitioner Details").first.wait_for(timeout=12000)
+            except Exception:
+                # Still proceed; modal locator may work
+                pass
+
+            # Extract practitioner name (used for output filename)
+            practitioner_name = ""
+            try:
+                # Scope to dialog if we have one
+                scope = modal if await modal.count() else page
+                txt = await scope.inner_text()
+                m_name = re.search(r"\bName\b\s*\n\s*([^\n]+)", txt, flags=re.IGNORECASE)
+                if m_name:
+                    practitioner_name = m_name.group(1).strip()
+                else:
+                    # fallback: look for first strong-ish text line under the "Name" column
+                    # This is intentionally loose; evidence snapshots will show correctness.
+                    pass
+            except Exception:
+                practitioner_name = ""
+
+            # Prepare target filename
+            base_name = practitioner_name if practitioner_name else f"NMC-{pin}"
+            target_filename = f"{base_name} nmc check.pdf"
+            target_filename = _safe_filename(target_filename)
+            target_path = (out_path_dir / target_filename)
+
+            # Find the "Download a pdf" control inside the modal first
+            download_locators = [
+                (modal, "a:has-text('Download a pdf')"),
+                (modal, "button:has-text('Download a pdf')"),
+                (page, "a:has-text('Download a pdf')"),
+                (page, "button:has-text('Download a pdf')"),
+                (page, "a[href*='pdf=1' i]"),
             ]
 
-            # Sometimes it opens in same tab; prefer expect_download
             downloaded_path: Optional[Path] = None
-            for sel in dl_selectors:
+
+            async def _save_pdf_bytes(pdf_bytes: bytes, pth: Path) -> None:
+                pth.parent.mkdir(parents=True, exist_ok=True)
+                with open(pth, "wb") as f:
+                    f.write(pdf_bytes)
+
+            # Attempt 1: real browser download
+            for scope, sel in download_locators:
                 try:
-                    loc = page.locator(sel).first
-                    if await loc.count() and await loc.is_visible():
-                        async with page.expect_download(timeout=20000) as dl_info:
+                    loc = scope.locator(sel).first
+                    if not (await loc.count()):
+                        continue
+                    if not (await loc.is_visible()):
+                        continue
+
+                    # Try download event
+                    try:
+                        async with page.expect_download(timeout=15000) as dl_info:
                             await loc.click(timeout=8000)
                         download = await dl_info.value
-                        suggested = download.suggested_filename or "nmc-register.pdf"
-                        target_dir = _ensure_dir(out_path_dir)
-                        target_path = forced_pdf_path or (target_dir / _safe_filename(suggested))
                         await download.save_as(str(target_path))
                         downloaded_path = target_path
                         break
-                except PWTimeoutError:
-                    continue
+                    except PWTimeoutError:
+                        pass
+
+                    # Attempt 2: opens a new page/tab
+                    try:
+                        async with context.expect_page(timeout=7000) as pg_info:
+                            await loc.click(timeout=8000)
+                        pdf_page = await pg_info.value
+                        await pdf_page.wait_for_load_state("domcontentloaded", timeout=15000)
+                        pdf_url = pdf_page.url
+                        resp = await context.request.get(pdf_url, timeout=20000)
+                        if resp.ok:
+                            b = await resp.body()
+                            if b and len(b) > 1000:
+                                await _save_pdf_bytes(b, target_path)
+                                downloaded_path = target_path
+                        await pdf_page.close()
+                        if downloaded_path:
+                            break
+                    except PWTimeoutError:
+                        pass
+                    except Exception:
+                        pass
+
+                    # Attempt 3: same-page navigation to ?pdf=1
+                    try:
+                        before_url = page.url
+                        await loc.click(timeout=8000)
+                        await page.wait_for_timeout(1200)
+                        after_url = page.url
+                        if after_url != before_url and ("pdf" in after_url.lower() or "pdf=1" in after_url.lower()):
+                            resp = await context.request.get(after_url, timeout=20000)
+                            if resp.ok:
+                                b = await resp.body()
+                                if b and len(b) > 1000:
+                                    await _save_pdf_bytes(b, target_path)
+                                    downloaded_path = target_path
+                            # Go back so we can still snapshot in case of error
+                            try:
+                                await page.go_back(timeout=10000)
+                            except Exception:
+                                pass
+                            if downloaded_path:
+                                break
+                    except Exception:
+                        pass
+
                 except Exception:
                     continue
 
             if downloaded_path and downloaded_path.exists() and downloaded_path.stat().st_size > 0:
+
                 await context.close()
                 await browser.close()
                 return {"ok": True, "pdf_path": str(downloaded_path), "error": "", "stage": "download"}
 
             # If no download event, try print-to-pdf of details page as fallback (still useful)
-            snap = await _page_snapshot_pdf(page, out_path_dir, "NMC-details")
+            snap = await _full_page_snapshot_pdf(
+                page,
+                out_path_dir,
+                "NMC-details",
+                "NMC Details Page",
+                [
+                    f"PIN: {pin}",
+                    "Stage: download",
+                    f"PIN filled as observed: {observed}",
+                    "Could not trigger official 'Download PDF'. This is a full-page screenshot snapshot.",
+                ],
+            )
             await context.close()
             await browser.close()
 
