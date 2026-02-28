@@ -115,7 +115,18 @@ async def _save_shot(page, out_dir: Path, prefix: str, shots: List[Path]) -> Non
 
 
 async def _accept_cookies_and_wait_enable_pin(page, out_dir: Path, shots: List[Path]) -> None:
-    """Accept Cookiebot consent (if present) and wait until PIN input is enabled."""
+    """Accept Cookiebot consent (if present) and wait until PIN input is enabled.
+
+    Why we do so much here:
+    - On the NMC site, the PIN input is gated by Cookiebot and stays disabled with class
+      'cookies-only-disabled' until consent is registered.
+    - Pure "click the banner" is flaky in automation (late-load, iframe, overlay, focus traps).
+    - So we do a 4-step fallback sequence:
+        1) Click common Cookiebot accept buttons (page + iframes)
+        2) Call Cookiebot JS APIs if present
+        3) Set common consent cookies then reload
+        4) (Last resort) remove the blocking class + hide overlay so the flow can proceed
+    """
     await _save_shot(page, out_dir, "01_before_cookies", shots)
 
     cookie_selectors = [
@@ -144,10 +155,27 @@ async def _accept_cookies_and_wait_enable_pin(page, out_dir: Path, shots: List[P
                 continue
         return False
 
-    # Try main page first
-    clicked = await try_click_in_context(page)
+    pin_loc = page.locator("#PinNumber").first
+    await pin_loc.wait_for(state="visible", timeout=20000)
 
-    # Try iframes (Cookiebot sometimes renders inside a frame)
+    async def pin_enabled() -> bool:
+        cls = (await pin_loc.get_attribute("class")) or ""
+        dis = await pin_loc.get_attribute("disabled")
+        return (dis is None) and ("cookies-only-disabled" not in cls)
+
+    async def wait_pin_enabled(ms_total: int) -> bool:
+        end = time.time() + (ms_total / 1000.0)
+        while time.time() < end:
+            try:
+                if await pin_enabled():
+                    return True
+            except Exception:
+                pass
+            await page.wait_for_timeout(350)
+        return False
+
+    # 1) Try clicking banner buttons on page and in iframes
+    clicked = await try_click_in_context(page)
     if not clicked:
         for fr in page.frames:
             try:
@@ -159,45 +187,107 @@ async def _accept_cookies_and_wait_enable_pin(page, out_dir: Path, shots: List[P
 
     await page.wait_for_timeout(900)
     await _save_shot(page, out_dir, "02_after_cookie_click", shots)
+    if await wait_pin_enabled(8000):
+        return
 
-    pin_loc = page.locator("#PinNumber").first
-    await pin_loc.wait_for(state="visible", timeout=20000)
+    # 2) Try Cookiebot JS APIs (when available)
+    try:
+        await page.evaluate(
+            """() => {
+                try {
+                    if (window.Cookiebot && typeof window.Cookiebot.submitCustomConsent === 'function') {
+                        window.Cookiebot.submitCustomConsent(true, true, true);
+                        return 'submitCustomConsent';
+                    }
+                    if (window.Cookiebot && typeof window.Cookiebot.submitConsent === 'function') {
+                        window.Cookiebot.submitConsent(true, true, true);
+                        return 'submitConsent';
+                    }
+                    if (window.Cookiebot && window.Cookiebot.consent) {
+                        window.Cookiebot.consent.preferences = true;
+                        window.Cookiebot.consent.statistics = true;
+                        window.Cookiebot.consent.marketing = true;
+                        return 'consentObject';
+                    }
+                } catch (e) {}
+                return null;
+            }"""
+        )
+    except Exception:
+        pass
 
-    async def pin_enabled() -> bool:
-        cls = (await pin_loc.get_attribute("class")) or ""
-        dis = await pin_loc.get_attribute("disabled")
-        return (dis is None) and ("cookies-only-disabled" not in cls)
-
-    # First wait (~8s)
-    for _ in range(20):
-        try:
-            if await pin_enabled():
-                return
-        except Exception:
-            pass
-        await page.wait_for_timeout(400)
-
-    # If still blocked, reload (consent should persist)
-    await page.reload(wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(900)
-    await _save_shot(page, out_dir, "02b_after_reload", shots)
+    await _save_shot(page, out_dir, "02c_after_cookiebot_js", shots)
+    if await wait_pin_enabled(6000):
+        return
 
+    # 3) Set common consent cookies then reload.
+    try:
+        ctx = page.context
+        domains = [".nmc.org.uk", "www.nmc.org.uk"]
+        cookies = []
+        for d in domains:
+            cookies.extend(
+                [
+                    {"name": "CookieConsent", "value": "true", "domain": d, "path": "/"},
+                    {"name": "CookiebotDialogClosed", "value": "true", "domain": d, "path": "/"},
+                    {
+                        "name": "CookiebotConsent",
+                        "value": "preferences%3Dtrue%26statistics%3Dtrue%26marketing%3Dtrue",
+                        "domain": d,
+                        "path": "/",
+                    },
+                ]
+            )
+        await ctx.add_cookies(cookies)
+    except Exception:
+        pass
+
+    try:
+        await page.reload(wait_until="domcontentloaded", timeout=60000)
+    except Exception:
+        await page.goto(page.url, wait_until="domcontentloaded", timeout=60000)
+
+    await page.wait_for_timeout(900)
+    await _save_shot(page, out_dir, "02d_after_cookie_cookies_reload", shots)
     pin_loc = page.locator("#PinNumber").first
     await pin_loc.wait_for(state="visible", timeout=20000)
+    if await wait_pin_enabled(9000):
+        return
 
-    # Second wait (~12s)
+    # 4) LAST RESORT: remove the client-side gate + overlay.
+    try:
+        await page.evaluate(
+            """() => {
+                const pin = document.querySelector('#PinNumber');
+                if (pin) {
+                    pin.classList.remove('cookies-only-disabled');
+                    pin.removeAttribute('disabled');
+                }
+                const ids = ['CybotCookiebotDialog','CybotCookiebotDialogBody','CybotCookiebotDialogBodyContent'];
+                for (const id of ids) {
+                    const el = document.getElementById(id);
+                    if (el) el.remove();
+                }
+                const overlays = document.querySelectorAll('[id^="CybotCookiebot"], .CybotCookiebotDialog');
+                overlays.forEach(e => { try { e.remove(); } catch(_) {} });
+            }"""
+        )
+    except Exception:
+        pass
+
+    await page.wait_for_timeout(500)
+    await _save_shot(page, out_dir, "02e_after_force_enable", shots)
+    if await wait_pin_enabled(3000):
+        return
+
     last_class = ""
     last_disabled = None
-    for _ in range(30):
-        try:
-            last_class = (await pin_loc.get_attribute("class")) or ""
-            last_disabled = await pin_loc.get_attribute("disabled")
-            if (last_disabled is None) and ("cookies-only-disabled" not in last_class):
-                return
-        except Exception:
-            pass
-        await page.wait_for_timeout(400)
-
+    try:
+        last_class = (await pin_loc.get_attribute("class")) or ""
+        last_disabled = await pin_loc.get_attribute("disabled")
+    except Exception:
+        pass
     raise RuntimeError(
         f"PIN input still disabled after cookie consent. disabled={last_disabled}, class='{last_class}'"
     )
