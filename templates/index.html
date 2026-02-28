@@ -7,31 +7,39 @@
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-  <div class="wrap">
-    <h1>NMC Live Check</h1>
-    <p class="subtitle">Upload an NMC document, extract the PIN, review/edit it, then download the register PDF.</p>
+  <div class="page">
+    <div class="container">
+      <h1>NMC Live Check</h1>
+      <p class="subtitle">Upload an NMC document, extract the PIN, review/edit it, then download the register PDF.</p>
 
-    <div class="card">
-      <h2>Step 1 — Upload NMC document</h2>
-      <label class="label">NMC document (PDF / JPG / PNG)</label>
-      <input id="file" type="file" accept=".pdf,.jpg,.jpeg,.png" />
-      <div class="actions">
-        <button id="btnExtract" class="btn primary">Extract PIN</button>
+      <div class="card">
+        <h2>Step 1 — Upload NMC document</h2>
+        <label class="label">NMC document (PDF / JPG / PNG)</label>
+        <input type="file" id="fileInput" accept=".pdf,.jpg,.jpeg,.png" />
+        <div class="actions">
+          <button id="btnExtract" class="btn primary" type="button">Extract PIN</button>
+        </div>
+        <div class="hint" id="extractHint"></div>
       </div>
-      <div id="status" class="status">Waiting…</div>
-    </div>
 
-    <div id="step2" class="card">
-      <h2>Step 2 — Extracted PIN (editable)</h2>
-      <label class="label">NMC PIN</label>
-      <input id="pin" type="text" placeholder="e.g. 18A1021E" disabled />
-      <div class="actions">
-        <button id="btnRun" class="btn primary" disabled>Run NMC Check &amp; Download PDF</button>
+      <div class="card">
+        <h2>Step 2 — Extracted PIN (editable)</h2>
+        <label class="label" for="pinInput">NMC PIN</label>
+        <input type="text" id="pinInput" placeholder="e.g. 12A3456S" disabled />
+        <div class="actions">
+          <button id="btnRun" class="btn primary" type="button" disabled>Run NMC Check &amp; Download PDF</button>
+        </div>
+        <p class="tip">
+          If the website blocks access (CAPTCHA / bot check) you will still receive an error PDF explaining what happened.<br/>
+          Tip: If you ever see “Please verify you are not a robot”, accept the website cookies first. The NMC itself notes this requirement.
+        </p>
       </div>
-      <p class="hint">If the website blocks access (CAPTCHA / bot check) you will still receive an error PDF explaining what happened.</p>
-      <p class="hint">Tip: If you ever see “Please verify you are not a robot”, accept the website cookies first. The NMC itself notes this requirement.</p>
-    </div>
 
+      <div class="card">
+        <h3>Status</h3>
+        <div id="statusBox" class="status">Waiting…</div>
+      </div>
+    </div>
   </div>
 
   <script src="/static/app.js"></script>

@@ -1,83 +1,66 @@
-const fileInput = document.getElementById('file');
-const statusEl = document.getElementById('status');
-
-const step2 = document.getElementById('step2');
-const pinInput = document.getElementById('pin');
-
-const btnExtract = document.getElementById('btnExtract');
-const btnRun = document.getElementById('btnRun');
-
 function setStatus(msg) {
-  statusEl.textContent = msg;
+  const box = document.getElementById('statusBox');
+  if (box) box.textContent = msg;
 }
 
-function downloadBlob(blob, filename) {
-  const url = window.URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  window.URL.revokeObjectURL(url);
+function setExtractHint(msg) {
+  const el = document.getElementById('extractHint');
+  if (el) el.textContent = msg || '';
 }
 
-function setStep2Enabled(enabled) {
-  pinInput.disabled = !enabled;
-  btnRun.disabled = !enabled;
+function getFile() {
+  const input = document.getElementById('fileInput');
+  return (input && input.files && input.files[0]) ? input.files[0] : null;
 }
 
-setStep2Enabled(false);
+async function extractPin() {
+  const file = getFile();
+  if (!file) { setStatus('Please choose a file first.'); return; }
 
-btnExtract.addEventListener('click', async () => {
-  const file = fileInput.files && fileInput.files[0];
-  if (!file) {
-    setStatus('Please choose a file.');
-    return;
-  }
-
-  btnExtract.disabled = true;
-  setStep2Enabled(false);
+  // Reset UI state for a fresh extraction
+  setExtractHint('');
   setStatus('Extracting PIN…');
+  const pinInput = document.getElementById('pinInput');
+  const btnRun = document.getElementById('btnRun');
+  if (pinInput) { pinInput.value = ''; pinInput.disabled = true; }
+  if (btnRun) btnRun.disabled = true;
+
+  const fd = new FormData();
+  fd.append('file', file);
 
   try {
-    const fd = new FormData();
-    fd.append('file', file);
-
     const res = await fetch('/extract', { method: 'POST', body: fd });
     const data = await res.json().catch(() => ({}));
-
     if (!res.ok || !data.ok) {
-      setStatus(data.detail || data.error || 'Extraction failed.');
-      pinInput.value = '';
+      setStatus(data.detail || 'Extraction failed.');
       return;
     }
 
-    const pin = (data.nmc_pin || '').trim().toUpperCase();
-    pinInput.value = pin;
-    setStep2Enabled(true);
+    const pin = (data.nmc_pin || '').trim();
+    if (!pin) {
+      setStatus('Could not find an NMC PIN in this file. Try a clearer document or edit manually.');
+      if (pinInput) { pinInput.disabled = false; pinInput.focus(); }
+      if (btnRun) btnRun.disabled = false;
+      return;
+    }
 
-    setStatus(pin ? 'PIN extracted. Please review/edit it, then run the check.' : 'No PIN found. Please enter manually and run.');
-    if (!pin) pinInput.focus();
+    if (pinInput) { pinInput.value = pin; pinInput.disabled = false; }
+    if (btnRun) btnRun.disabled = false;
+
+    setStatus('PIN extracted. Please review/edit if needed, then click “Run NMC Check & Download PDF”.');
   } catch (e) {
-    setStatus('Extraction error: ' + (e?.message || e));
-    pinInput.value = '';
-  } finally {
-    btnExtract.disabled = false;
+    setStatus('Extraction failed (network error).');
   }
-});
+}
 
-btnRun.addEventListener('click', async () => {
-  const pin = (pinInput.value || '').trim().toUpperCase();
-  if (!pin) {
-    setStatus('Please enter an NMC PIN.');
-    pinInput.focus();
-    return;
-  }
+async function runCheck() {
+  const file = getFile();
+  if (!file) { setStatus('Please choose a file first.'); return; }
 
-  btnExtract.disabled = true;
-  setStep2Enabled(false);
-  setStatus('Running NMC check… (this may take a moment)');
+  const pin = (document.getElementById('pinInput')?.value || '').trim();
+  if (!pin) { setStatus('Please enter an NMC PIN.'); return; }
+
+  setStatus('Running NMC check… this may take 30–90 seconds.');
 
   try {
     const res = await fetch('/run-pin', {
@@ -86,25 +69,40 @@ btnRun.addEventListener('click', async () => {
       body: JSON.stringify({ nmc_pin: pin })
     });
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => null);
-      setStatus(err?.detail || 'Run failed.');
-      btnExtract.disabled = false;
-      setStep2Enabled(true);
+    const blob = await res.blob();
+    const isPdf = (blob.type || '').includes('pdf') || (res.headers.get('content-type') || '').includes('pdf');
+
+    if (!res.ok && !isPdf) {
+      const text = await blob.text().catch(() => '');
+      setStatus(text || 'Run failed.');
       return;
     }
 
-    const blob = await res.blob();
+    // Always download whatever comes back (success PDF or error PDF)
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+
     const cd = res.headers.get('content-disposition') || '';
-    const match = /filename="?([^"]+)"?/i.exec(cd);
-    const filename = match ? match[1] : 'NMC-Result.pdf';
-    downloadBlob(blob, filename);
+    const match = cd.match(/filename="?([^";]+)"?/i);
+    a.download = match ? match[1] : 'nmc-result.pdf';
+
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
 
     setStatus('Done. PDF downloaded.');
   } catch (e) {
-    setStatus('Run error: ' + (e?.message || e));
-  } finally {
-    btnExtract.disabled = false;
-    setStep2Enabled(true);
+    setStatus('Run failed (network error).');
   }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('btnExtract')?.addEventListener('click', extractPin);
+  document.getElementById('btnRun')?.addEventListener('click', runCheck);
+
+  // Ensure initial state is clean
+  setStatus('Waiting…');
+  setExtractHint('');
 });
